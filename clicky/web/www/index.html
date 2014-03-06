@@ -1,0 +1,331 @@
+<html>
+    <head>
+        <meta name="viewport" content="user-scalable=no, width=device-width, initial-scale=1, maximum-scale=1">
+        <style>
+            body {margin:0;padding:0}
+        </style>
+    </head>
+    <body>
+        <script src="./class.js"></script>
+        <script src="./jquery.min.js"></script>
+        <script src="./msgpack.js"></script>
+        <script src="./hammer.min.js"></script>
+        <script src="./hammer.fakemultitouch.js"></script>
+        <script src="./hammer.showtouches.js"></script>
+        <!--<script src="./require.js"></script>-->
+        <script>
+
+            var MessageIO = Class.extend({
+                init: function(opencallback, renderer) {
+                    this.ws = new WebSocket('ws://' + 
+                            window.location.hostname + ':9201');
+                    this.ws.binaryType = 'arraybuffer';
+                    
+                    var me = this;
+                    this.ws.onmessage = function(e) {me.onMessage(e);};
+                    this.ws.onopen = opencallback;
+
+                    this.R = renderer;
+                    this.R.clickHandler = this;
+                },
+                send: function(msg) {
+                    this.ws.send(msgpack.encode(message));
+                },
+                click: function(coords) {
+                    //FIXME: buffer clicks
+                    message = {message_name:'clicks',
+                        name:'rob',clicks:[{pixel:[coords.x,coords.y],
+                                            rgb: [255,255,255], num:1}]};
+                    this.R.localClick(message, this.power);
+                    this.send(message);
+                },
+                onMessage: function(e) {
+                    var m = msgpack.decode(e.data);
+                    //var m = JSON.parse(e.data);
+                    console.log('message id ', m.id);
+                    if(m.message_name == 'region') {
+                        console.log('region received');
+                        this.R.drawRegion(m);
+                    } else if(m.message_name == 'click_update') {
+                        console.log('clicks received', m);
+                        if(m.id != this.request_id)
+                            return;
+
+                        this.R.drawClicks(m);
+                    } else if(m.message_name == 'game_info') {
+                        console.log('got game_info ', m);
+                        this.R.maxVisible = m.width;
+                        this.R.setView(m.width);
+                        this.R.startX = 0;
+                        this.R.startY = 0;
+                        this.R.endX = m.width - 1;
+                        this.R.endY = m.height - 1;
+
+                        this.get_region(0, 0, m.width-1, m.height-1);
+                        this.subscribe_region(0, 0, m.width-1, m.height-1);
+                        this.power = m.power;
+                    }
+                },
+                get_region: function(x1, y1, x2, y2) {
+                    var id = Math.random().toString()
+                    message = {message_name:'get_region',
+                               region:{
+                                   top_left:[x1,y1],
+                                   bottom_right:[x2,y2]},
+                               id:id};
+                    this.send(message);
+               },
+                subscribe_region: function(x1, y1, x2, y2) {
+                    this.request_id = Math.random().toString()
+                    message = {message_name:'subscribe_region',
+                               region:{
+                                   top_left:[x1,y1],
+                                   bottom_right:[x2,y2]},
+                               id:this.request_id};
+                    console.log('subscription ',message.region, message.id);
+                    this.send(message);
+                },
+                game_info: function(id) {
+                    message = {message_name:'game_info', id:id};
+                    this.send(message);
+                },
+               
+            });
+
+            var Renderer = Class.extend({
+                init: function() {
+                    this.clickHandler = null;
+
+                    this.W = $(document).width();
+                    this.H = $(document).height();
+
+                    var elem = '<canvas id=draw width=' + this.W + 
+                    ' height=' + this.H + '></canvas>';
+                    $(document.body).append(elem);
+
+                    this.ctx = $('#draw')[0].getContext('2d');
+                    this.currentScale = 1.0;
+                    
+                    // handler for clicks, forward them to the click method of 
+                    // the handler, after converting to game coordinates
+                    var me = this;
+                    $('#draw').click(function(e) {
+                        var coords = me.clientToXY(e.clientX, e.clientY);
+                        console.log('click ', e.clientX, e.clientY, coords);
+                        me.clickHandler.click(coords);
+                    });
+
+                    $('#draw').on('DOMMouseScroll mousewheel', function(e) {
+                        if(e.originalEvent.wheelDelta > 0) {
+                            me.zoom(true);
+                        } else {
+                            me.zoom(false);
+                        }
+                    });
+
+                    Hammer($('#draw')[0]).on('release', function(e) {
+                        me.lastPinch = null;
+                    });
+                    Hammer($('#draw')[0]).on('pinchin pinchout', function(e) {
+                        console.log('PINCH');
+                        if (me.lastPinch != null) {
+                            var delta = me.lastPinch - event.gesture.scale;
+                            if(delta > 0) {
+                                me.zoom(true);
+                            } else {
+                                me.zoom(false);
+                            }
+                        }
+                        me.lastPinch = event.gesture.scale;
+                    });
+
+                    Hammer($('#draw')[0]).on('dragend', function(event) {
+                        me.lastDrag = null;
+                    });
+                    Hammer($('#draw')[0]).on('dragright dragleft', function(event) {
+                        console.log(event);
+                        if(me.lastDrag != null) {
+                            var deltax = me.lastDrag.pageX-event.gesture.center.pageX;
+                            var deltay = me.lastDrag.pageY-event.gesture.center.pageY;
+                            me.translate({x:deltax, y:deltay});
+                            me.drawRegion();
+                            event.gesture.preventDefault();
+                        }
+                        me.lastDrag = event.gesture.center;
+                    });
+
+                    this.pixels = {};
+                    this.pixelsSet = false;
+
+                },
+
+                zoom: function(zoomin) {
+                    if(zoomin) {
+                        this.S *= 1.05;
+                    } else {
+                        this.S *= 0.95;
+                    }
+                    if(this.S < this.minS) {
+                        this.S = this.minS;
+                    } else if(this.S > 100) {
+                        this.S = 100;
+                    }
+
+                    this.drawRegion(this.lastRegion);
+                },
+
+                translate: function(delta) {
+                    this.xoffset += delta.x;
+                    this.yoffset += delta.y;
+
+                    //var maxXoffset = 
+
+                    if(this.xoffset <= 0)
+                        this.xoffset = 0;
+                    if(this.yoffset <= 0)
+                        this.yoffset = 0;
+                   
+                },
+
+                setView: function(visibleSquares) {
+                    // visibleSquares is num squares shown across top
+                    this.visibleSquares = visibleSquares;
+
+                    // side length;
+                    this.S = Math.max(this.H,this.W) / this.visibleSquares;
+
+                    // the smallest size we will render a square
+                    if(typeof(this.minS) === 'undefined')
+                        this.minS = this.S;
+                    
+                    this.visible = {topLeft:{x:0,y:0}, 
+                        bottomRight:{x:visibleSquares, y:visibleSquares}};
+                    this.yoffset = 0;
+                    this.xoffset = 0;
+
+                },
+                
+                clientToXY: function(clientx, clienty) {
+                    var y = (clienty + this.yoffset) / this.S;
+                    var x = (clientx + this.xoffset) / this.S;
+
+                    return {x:Math.floor(x), y:Math.floor(y)};
+                },
+
+                xyToClient: function(x, y) {
+                    return {y: y * this.S - this.yoffset,
+                            x: x * this.S - this.xoffset};
+                },
+                drawRegion: function(msg) {
+
+                    if(!this.pixelsSet) {
+                        var i = 0;
+                        for(var y = this.startY; y <= this.endY; y++) {
+                            for(var x = this.startX; x <= this.endX; x++) {
+                                var rgb = msg.pixels.slice(i, i+3);
+                                var key = x + ',' + y;
+                                this.pixels[key] = {rgb:rgb, defense:0};
+                                i+=3;
+                            }
+                        }
+                        // store defenses
+                        for(var i = 0; i < msg.defense.length; i++) {
+                            var d = msg.defense[i];
+                            key = d[0] + ',' + d[1];
+                            this.pixels[key].defense = d[2];
+                        }
+                        this.pixelsSet = true;
+                    }
+
+                    this.ctx.clearRect(0,0,this.W,this.H);
+                    var i = 0, ctx = this.ctx, S = this.S, coords = null, key = null, rgb = null;
+
+                    for(var y = this.startY; y <= this.endY; y++) {
+                        //if(y > this.visible.bottomRight.y) break;
+                        
+                        for(var x = this.startX; x <= this.endX; x++) {
+                            //if(x > this.visible.bottomRight.x) break;
+                            key = x + ',' + y;
+                            rgb = this.pixels[key].rgb;
+
+                            coords = this.xyToClient(x, y);
+                            this.drawRect(coords.x, coords.y, rgb, S);
+                            
+                        }
+                    }
+
+                },
+
+                drawRect: function(x, y, rgb, S) {
+                    // S = side length
+                    //console.log('drawing rect at ', x, y);
+                    this.ctx.fillStyle = 'rgb('+rgb[0] +','+rgb[1]+','+rgb[2]+')';
+                    this.ctx.fillRect(x, y, S, S);
+                },
+
+                drawClicks: function(msg) {
+                    var click = null, x = null, y = null, coords = null,
+                        S = this.S, key = null;
+                    for(var i = 0; i < msg.clicks.length; i++) {
+                        click = msg.clicks[i];
+                        coords = this.xyToClient(click.pixel[0], click.pixel[1]);
+                        key = click.pixel[0] + ',' + click.pixel[1];
+                        this.pixels[key].defense = click.defense;
+                        this.drawRect(coords.x, coords.y, click.rgb, S);
+                    }
+                },
+
+                localClick: function(msg, power) {
+                    click = msg.clicks[0];
+                    coords = this.xyToClient(click.pixel[0], click.pixel[1]);
+                    // make sure we have coords in center of square
+                    rgb = this.getRGB(coords.x + this.S/2, coords.y + this.S/2);
+                    console.log('xy=', click.pixel, ' client=',coords, 
+                        ' clickrgb =', click.rgb, ' rgb =', rgb);
+
+                    var key = click.pixel[0] + ',' + click.pixel[1];
+                    var def = this.pixels[key].defense;
+
+                    for(var j = 0; j < power; j++) {
+                        if(click.rgb == rgb) {
+                            // update defense
+                            this.pixels[key].defense++;
+                        } else if(this.pixels[key].defense == 0) {
+                            // adjust color
+                            for(var i = 0; i < 3; i++) {
+                                if(click.rgb[i] < rgb[i]) {
+                                    rgb[i]--;
+                                } else if(click.rgb[i] > rgb[i]) {
+                                    rgb[i]++;
+                                }
+                            }
+                        }
+                    }
+                    console.log('updated rgb=', rgb);
+                    this.pixels[key].rgb = rgb;
+                    this.drawRect(coords.x, coords.y, rgb, this.S);
+                },
+                getRGB: function(x, y) {
+                    // note that passing float values to getImageData with a width of
+                    // 1 1 will return an array of 4 colors vs 1.  I dont get this
+                    // so flooring values first
+                    var r = this.ctx.getImageData(Math.floor(x), Math.floor(y),
+                        1, 1).data;
+                    var ret = [r[0],r[1],r[2]];
+                    console.log('color = ', ret);
+                    return ret;
+                },
+                play:function() { this.two.play(); },
+                update:function() { this.two.update(); },
+                pause:function() { this.two.pause(); }
+            });
+
+            $(document).ready(function() {
+                r = new Renderer();
+                mio = new MessageIO(function() {
+                    mio.game_info(1);
+                }, r);
+            });
+        </script>
+    </body>
+</html>
